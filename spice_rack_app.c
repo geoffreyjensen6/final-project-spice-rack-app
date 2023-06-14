@@ -7,9 +7,16 @@
 #include <syslog.h>
 #include <unistd.h>
 #include <limits.h>
+#include <signal.h>
+#include <time.h>
+#include <pthread.h>
+#include "spice_rack_app.h"
 
 #define MAX_SPICE_NUM_DIGITS 2
 #define MAX_SPICE_NAME_SIZE 32
+#define SPICE_RACK_SIZE 3
+#define NUM_COLUMNS 4
+#define EMPTY_JAR_MASS_DEF 133.245
 #define CALIBRATE_BTN_VAL_FILE "/sys/class/gpio/gpio27/value"
 #define CALIBRATE_BTN_DIR_FILE "/sys/class/gpio/gpio27/direction"
 #define CALIBRATE_GPIO "27"
@@ -17,7 +24,7 @@
 #define FSR_FILE "/dev/fsr_gpio_0"
 #define OUTPUT_FILE "/var/tmp/spice_rack_measurements.txt"
 
-int empty_jar_mass = 128;
+struct spice_rack *spice_rack;
 
 //Finding the file size in order to malloc appropriately sized char *.
 off_t find_file_size(char *file_name){
@@ -39,6 +46,94 @@ off_t find_file_size(char *file_name){
 
 	close(fd);
 	return file_length;
+}
+
+int copy_file_contents(int in_fd, int out_fd, off_t end_location){
+	int result = 0;
+	off_t rd_count = 0;
+	off_t wr_count = 0;
+	off_t read_len = 1;
+	off_t curr_position;
+	char next_char[1];
+	
+	curr_position = lseek(in_fd, 0, SEEK_SET);
+	if(curr_position  == -1){
+		perror("Spice_Rack_App: search_file - Seeking to beginning of file failed - ");
+		return -1;
+	}
+
+	if(end_location != 0){
+		read_len = end_location - curr_position;
+	}
+	else{
+		read_len = 1;
+	}
+	while((rd_count = read(in_fd, next_char, 1)) != 0 && (read_len != 0)){
+		if(rd_count == -1){
+			if(errno == EINTR){
+				continue;
+			}
+			perror("Spice_Rack_App: Reading File failed - ");
+			result = -1;
+			break;
+		}
+		if(*next_char == EOF){
+			printf("Found EOF");
+			break;
+		}
+		read_len = read_len - rd_count;
+		wr_count = write(out_fd, next_char, 1);
+		if(wr_count == -1){
+			perror("Spice_Rack_App: Writing Measurements to File failed - ");
+			result = -1;
+		}
+	}
+		
+	return result;
+}
+
+int copy_file(int in_fd, int out_fd, off_t end_location){
+	int result = 0;
+	off_t rd_count = 0;
+	off_t wr_count = 0;
+	off_t read_len = 1;
+	off_t curr_position;
+	char next_char[1];
+	
+	curr_position = lseek(in_fd, 0, SEEK_CUR);
+	if(curr_position  == -1){
+		perror("Spice_Rack_App: search_file - Seeking to beginning of file failed - ");
+		return -1;
+	}
+
+	if(end_location != 0){
+		read_len = end_location - curr_position;
+	}
+	else{
+		read_len = 1;
+	}
+	while((rd_count = read(in_fd, next_char, 1)) != 0 && (read_len != 0)){
+		if(rd_count == -1){
+			if(errno == EINTR){
+				continue;
+			}
+			perror("Spice_Rack_App: Reading File failed - ");
+			result = -1;
+			break;
+		}
+		if(*next_char == EOF){
+			printf("Found EOF");
+			break;
+		}
+		read_len = read_len - rd_count;
+		wr_count = write(out_fd, next_char, 1);
+		if(wr_count == -1){
+			perror("Spice_Rack_App: Writing Measurements to File failed - ");
+			result = -1;
+		}
+	}
+		
+	return result;
 }
 
 //Read Entire file contents into char *. Used for parsing through the input file conents
@@ -63,31 +158,120 @@ int read_file(char *file_name, char *output_buf, off_t read_len){
 			break;
 		}
 		read_len = read_len - count;
+		printf("read_len = %li and count = %li\n", read_len, count);
 	}
+	printf("read_buf in read_file is :%s\n", output_buf);
 	
 	close(fd);
 	return result;
 }
 
+int read_line(int fd, char *output_str){
+	int count;
+	int result = 0;
+	char *read_buff;
+	read_buff = (char *)malloc(1 * sizeof(char));
+	memset(output_str,0,strlen(output_str));
+
+	while((count = read(fd, read_buff, 1)) != 0){
+		if(count == -1){
+			if(errno == EINTR){
+				continue;
+			}
+			perror("Spice_Rack_App: read_line - Reading File failed - ");
+			result = -1;
+			break;
+		}
+		if(strchr(read_buff, '\n') != NULL){
+			printf("output_str is %s\n", output_str);
+			break;
+		}
+		strcat(output_str, read_buff);
+	}
+	
+	free(read_buff);
+	return result;
+}
+
+int parse_line(char *output_str, int i){
+	int result = 0;
+	int substring_len = 0;
+	char *start_ptr = output_str;
+	char *comma_ptr;
+	int j;
+
+	for(j=0;j<NUM_COLUMNS;j++){
+		if((start_ptr = strstr(output_str, spice_rack->spices[i].spice_search_strings.search_strings[j])) != NULL){
+			start_ptr = start_ptr + strlen(spice_rack->spices[i].spice_search_strings.search_strings[j]);
+		}
+		if((comma_ptr = strchr(start_ptr, ',')) != NULL){
+			substring_len = comma_ptr - start_ptr + 1;
+			snprintf(spice_rack->spices[i].spice_entries.entries[j], substring_len, "%s", start_ptr);
+			start_ptr = output_str + strlen(spice_rack->spices[i].spice_search_strings.search_strings[j]) + substring_len;
+		}
+		//printf("Spice search string=%s and entry=%s\n", spice_rack->spices[i].spice_search_strings.search_strings[j], spice_rack->spices[i].spice_entries.entries[j]);
+	}
+	return result;
+}
+
+off_t search_file(int in_fd, char *search_term){
+	int i = 0;
+	off_t file_offset;
+	off_t end_of_line = 0;
+	char read_line_buff[120];
+	char *match_str;
+
+	//set position to beginning of file
+	file_offset = lseek(in_fd, 0, SEEK_SET);
+	if(file_offset  == -1){
+		perror("Spice_Rack_App: search_file - Seeking to beginning of file failed - ");
+		return -1;
+	}
+	
+	//Search through each line for the search term and stop on the line that you find it
+	for(i=1;i<=(SPICE_RACK_SIZE+2);i++){
+		//Grab file offset at beginning of line so we can restore it if we find a match
+		file_offset = lseek(in_fd, 0, SEEK_CUR);
+		if(file_offset  == -1){
+			perror("Spice_Rack_App: search_file - Seeking in file failed - ");
+			return -1;
+		}
+		printf("Current offset is %jd\n", file_offset);
+		read_line(in_fd, read_line_buff);
+		printf("Read Line is %s\n", read_line_buff);
+		if((match_str = strstr(read_line_buff, search_term)) != NULL){
+			printf("Found a match at line %i\n", i);
+			end_of_line = lseek(in_fd, 0, SEEK_CUR);
+			//Restore file offset to beginning of this line
+			file_offset = lseek(in_fd, file_offset, SEEK_SET);
+			printf("Restored file offset to %jd and end_of_line is %jd\n", file_offset, end_of_line);
+			if(file_offset  == -1){
+				perror("Spice_Rack_App: search_file - Seeking in file failed - ");
+				return -1;
+			}
+			break;
+		}		
+	}	
+
+	return end_of_line;
+}
+
 //Used to store measurement data to a file. Handles both creating for the first time as well as updating 
 //data for individual spices. 
-int store_measurement(int spice_num, char *spice_name, char *weight){
+int store_measurement(int spice_num, char *spice_name, char *weight, float mass){
 	int input_fd;
+	int temp_fd;
 	int output_fd;
 	int output_str_len;
 	int count;
 	int result = 0;
-	int need_to_insert = 0;	
 	off_t file_length = 0;
+	off_t file_offset = 0;
+	off_t eol;
 	off_t match_offset = 0;
-	off_t eol_offset = 0;
-	off_t write_len = 0;
 	char *spice_num_str;
-	char *match_str;
-	char *eol;
-	char *read_buff;
 	char file_name[] = OUTPUT_FILE;
-	char *output_str;
+	char *output_format_str;
 	
 	
 	//Open file for RD/WR and create if it doesn't already exist. 
@@ -96,17 +280,17 @@ int store_measurement(int spice_num, char *spice_name, char *weight){
 		perror("Spice_Rack_App: store_measurements - Failed to Open File - ");
 		return -1;
 	}
+	temp_fd = open("/var/log/spice_rack_tmp.txt", O_CREAT | O_RDWR | O_TRUNC, 0666);
+	if(temp_fd == -1){
+		perror("Spice_Rack_App: store_measurements - Failed to Open File - ");
+		return -1;
+	}
 	
 	//Find File Size
-	file_length = find_file_size(file_name);	
+	file_length = find_file_size(file_name);
 	syslog(LOG_DEBUG, "Spice_Rack_App: store_measurement - File length is %li\n", file_length);
-	
-	//Allocate Read Buffer which will hold the current file contents if there are any.
-	read_buff = (char *)malloc(file_length * sizeof(char));
-	memset(read_buff,0,file_length);
 
-	//Read complete file into buffer
-	if(read_file(file_name, read_buff, file_length) == -1){
+	if(copy_file(input_fd, temp_fd, EOF) == -1){
 		perror("Spice_Rack_App: store_measurement - Failed to read file contents to read buffer - ");
 		return -1;
 	}
@@ -114,7 +298,13 @@ int store_measurement(int spice_num, char *spice_name, char *weight){
 	//Close input file now that contents were all read out. Going to repoen this file and truncate 
 	//because often measurement changes could be fewer characters and lead to extra whitespace
 	//and newlines at the EOF. So it is needed to write whole file again to avoid that.
+	close(temp_fd);
 	close(input_fd);
+	temp_fd = open("/var/log/spice_rack_tmp.txt", O_RDONLY);
+	if(temp_fd == -1){
+		perror("Spice_Rack_App: store_measurements - Failed to Open File - ");
+		return -1;
+	}
 	//Open file for writing and create if it doesn't already exist and truncate because we will rewrite
 	output_fd = open(file_name, O_CREAT | O_WRONLY | O_TRUNC, 0666);
 	if(output_fd == -1){
@@ -124,80 +314,103 @@ int store_measurement(int spice_num, char *spice_name, char *weight){
 	
 	//Generate the new output string
 	//Output format is: Spice#	Spice_Name	Weight
-	//TODO Still need to incorporate the spice_name into length and format for output_string
 	if((strstr(spice_name, "Empty Jar") != NULL) || (strcmp(spice_name, "Empty Rack") == 0)){
-		spice_num_str = (char *)malloc(15 * sizeof(char));
+		spice_num_str = (char *)malloc(32 * sizeof(char));
+		if(spice_num_str == NULL){
+			perror("Spice_Rack_App: store_measurement - Couldn't allocate memory - ");
+		}
 		memset(spice_num_str,0,strlen(spice_num_str));
-		sprintf(spice_num_str, "N/A-%s", spice_name);
+		snprintf(spice_num_str,32,"N/A-%s", spice_name);
 	} 
 	else{
-		spice_num_str = (char *)malloc((MAX_SPICE_NUM_DIGITS+6) * sizeof(char));
+		spice_num_str = (char *)malloc(8 * sizeof(char));
+		if(spice_num_str == NULL){
+			perror("Spice_Rack_App: store_measurement - Couldn't allocate memory - ");
+		}
 		memset(spice_num_str,0,strlen(spice_num_str));
-		sprintf(spice_num_str, "Spice%i", spice_num);
+		snprintf(spice_num_str,7,"Spice%i", spice_num);
 	}
-	output_str_len = strlen(spice_num_str) + strlen(spice_name) + strlen(weight) + 16;
-	output_str = (char *)malloc(output_str_len * sizeof(char));
-	memset(output_str,0,output_str_len);
-	sprintf(output_str, "%s\t\tSpice_Name:%s\t%s\n", spice_num_str, spice_name, weight);
-	syslog(LOG_DEBUG, "Spice_Rack_App: store_measurement - output_str_len is %i and output_str is %s\n", output_str_len, output_str);
+	output_str_len = 120;
+	output_format_str = (char *)malloc(output_str_len * sizeof(char));
+	if(output_format_str == NULL){
+		perror("Spice_Rack_App: store_measurement - Couldn't allocate memory - ");
+		return -1;
+	}
+	memset(output_format_str,0,output_str_len);
+	snprintf(output_format_str, (output_str_len-1), "Spice_Location:%s,Spice_Name:%s,ADC_Reading:%s,Calibrated_Weight(grams):%3.6f\n", spice_num_str, spice_name, weight, mass);
+	syslog(LOG_DEBUG, "Spice_Rack_App: store_measurement - output_str_len is %i and output_str is %s\n", output_str_len, output_format_str);
 
-	//Check if Spice# already has an entry in the file
-	//If entry exists, seek to it. If doesn't exist, seek to EOF
-	match_str = strstr(read_buff, spice_num_str);
-	if(match_str != NULL){
-		match_offset = match_str - read_buff;
-		syslog(LOG_DEBUG, "Spice_Rack_App: store_measurement - Found a location in file where %s already exists. Overwriting and shifting data", spice_num_str);
-		need_to_insert = 1;
-		//Write all previous content up until the match location to the output file.
-		count = write(output_fd, read_buff, match_offset);
-		if(count == -1){
-			perror("Spice_Rack_App: Writing up to match location to File failed - ");
-			result = -1;
-		}
-		//If found entry, determine where the end of the line is for the entry in the current file. 
-		//We will overwrite it and the string size may change so we will need to shift all later data.
-		eol = strchr(match_str, '\n');
-		eol_offset = eol - match_str + 1;
-		if(eol_offset != output_str_len){
-			syslog(LOG_DEBUG, "Spice_Rack_App: store_measurement - line size changed. Need to shift all later data\n");
-		}
-	}
-	else{
-		//Write all previous content up until the EOF to the output file.
-		syslog(LOG_DEBUG, "Spice_Rack_App: store_measurement - %s entry doesn't exist in output file. Will append to the end", spice_num_str);
-		count = write(output_fd, read_buff, file_length);
-		if(count == -1){
-			perror("Spice_Rack_App: Writing all data to File failed - ");
-			result = -1;
-		}
-	}
 
-	//Write new Entry
-	syslog(LOG_DEBUG, "Spice_Rack_App: store_measurement - Writing output_str=%s to file", output_str);
-	count = write(output_fd, output_str, strlen(output_str));
-	if(count == -1){
-		perror("Spice_Rack_App: Writing Measurements to File failed - ");
-		result = -1;
-	}
-	
-	//Check if need_to_insert = 1 and then write remainder of file adjusted.
-	if(need_to_insert == 1){
-		match_str = eol_offset + match_str;
-		write_len = file_length - (match_str - read_buff);
-		count = write(output_fd, match_str, write_len);
+	if((eol = search_file(temp_fd, spice_num_str)) == 0){
+		//Will be appending data to EOF
+		printf("New Data. Need to append to EOF\n");
+		//Reset position to beginning of file
+		file_offset = lseek(temp_fd, 0, SEEK_SET);
+		if(file_offset  == -1){
+			perror("Spice_Rack_App: search_file - Seeking to beginning of file failed - ");
+			return -1;
+		}
+		//copy existing file contents
+		if(copy_file(temp_fd, output_fd, EOF) == -1){
+			perror("Spice_Rack_App: store_measurement - Failed to read file contents to read buffer - ");
+			return -1;
+		}
+		//Write new Entry
+		syslog(LOG_DEBUG, "Spice_Rack_App: store_measurement - Writing output_str=%s to file", output_format_str);
+		count = write(output_fd, output_format_str, strlen(output_format_str));
 		if(count == -1){
 			perror("Spice_Rack_App: Writing Measurements to File failed - ");
 			result = -1;
 		}
-	}		
-	close(output_fd);
-	free(spice_num_str);
-	syslog(LOG_DEBUG, "Made it Here\n");
-	free(read_buff);
-	syslog(LOG_DEBUG, "Made it Here\n");
-	free(output_str);
-	syslog(LOG_DEBUG, "Made it Here\n");
+	}
+	else{
+		//Will be inserting at current file position offset
+		printf("Found existing Entry with same Spice Number. Replacing that Line\n");
+		//Reset position to beginning of file
+		match_offset = lseek(temp_fd, 0, SEEK_CUR);
+		if(match_offset  == -1){
+			perror("Spice_Rack_App: search_file - Seeking to beginning of file failed - ");
+			return -1;
+		}
+		file_offset = lseek(temp_fd, 0, SEEK_SET);
+		if(file_offset  == -1){
+			perror("Spice_Rack_App: search_file - Seeking to beginning of file failed - ");
+			return -1;
+		}
 
+		//copy existing file contents up to the match location
+		if(match_offset > 0){
+			if(copy_file(temp_fd, output_fd, match_offset) == -1){
+				perror("Spice_Rack_App: store_measurement - Failed to read file contents to read buffer - ");
+				return -1;
+			}
+		}
+
+		//Write new Entry
+		syslog(LOG_DEBUG, "Spice_Rack_App: store_measurement - Writing output_str=%s to file", output_format_str);
+		count = write(output_fd, output_format_str, strlen(output_format_str));
+		if(count == -1){
+			perror("Spice_Rack_App: Writing Measurements to File failed - ");
+			result = -1;
+		}
+
+		file_offset = lseek(temp_fd, eol, SEEK_SET);
+		if(file_offset  == -1){
+			perror("Spice_Rack_App: search_file - Seeking to beginning of file failed - ");
+			return -1;
+		}		
+
+		//copy existing file contents from end of replaced line to EOF
+		if(copy_file(temp_fd, output_fd, EOF) == -1){
+			perror("Spice_Rack_App: store_measurement - Failed to read file contents to read buffer - ");
+			return -1;
+		}
+	}	
+
+	close(output_fd);
+	close(temp_fd);
+	free(output_format_str);
+	free(spice_num_str);
 	return result;
 }
 
@@ -206,7 +419,6 @@ int read_weight(char *read_val, int read_len){
 	int hx711_fd;
 	int count = 0;
 	int result = 0;
-	char *temp;
 	
 	hx711_fd = open(HX711_FILE, O_RDONLY);
 	if(hx711_fd == -1){
@@ -225,12 +437,6 @@ int read_weight(char *read_val, int read_len){
 		read_len = read_len - count;
 	}
 	
-	//Remove trailing newline character from string
-	temp = strchr(read_val, '\n');
-	if(temp != NULL){
-		*temp = '\0';
-	}
-
 	syslog(LOG_DEBUG,"Spice_Rack_App: read_weight - Weight Reading is %s", read_val);
 	close(hx711_fd);
 	return result;
@@ -243,6 +449,9 @@ int get_average_weight(char *read_val, int read_len, int sample_num){
 	int sample_average = 0;
 	char *end_ptr;
 
+	//store previous adc reading in struct before collecting new ones
+	spice_rack->previous_adc_reading = spice_rack->curr_adc_reading;
+
 	for(i=0; i<sample_num; i++){
 		read_weight(read_val, read_len);
 		sample_val = strtol(read_val, &end_ptr, 10);
@@ -251,7 +460,32 @@ int get_average_weight(char *read_val, int read_len, int sample_num){
 	}
 	sample_average = sample_total/sample_num;
 	syslog(LOG_DEBUG, "Sample Average is %i\n", sample_average);
+	snprintf(read_val, strlen(read_val), "%i", sample_average);
+	spice_rack->curr_adc_reading = sample_average;
 	return sample_average;
+}
+
+float adc_reading_to_grams(){
+	float m = 0;
+	int x = 0;
+	float result;
+	syslog(LOG_DEBUG, "Spice_Rack_App: adc_reading_to_grams - empty_jar_adc = %i, empty_rack_adc = %i, and empty_jar_mass = %f", spice_rack->empty_jar_adc, spice_rack->empty_rack_adc, spice_rack->empty_jar_mass);
+	if(spice_rack->empty_jar_adc && spice_rack->empty_rack_adc){
+		m = ((float)spice_rack->empty_jar_adc - spice_rack->empty_rack_adc)/spice_rack->empty_jar_mass;
+	}
+//TODO need to have a variable or struct that has Mutex access locks for previous weight and next weight. This way you can get Delta between the two and then calculate the actual adc_reading.
+	if(spice_rack->curr_adc_reading > spice_rack->previous_adc_reading){
+		x = spice_rack->curr_adc_reading - spice_rack->previous_adc_reading;
+	}
+	else{
+		x = spice_rack->previous_adc_reading - spice_rack->curr_adc_reading;
+	}
+
+	syslog(LOG_DEBUG,"x=%i and m=%f\n", x, m);
+	result = x/m - spice_rack->empty_jar_mass;
+	printf("Result is %f grams\n", result);
+
+	return result;
 }
 
 int read_fsr_status(){
@@ -291,13 +525,42 @@ int read_fsr_status(){
 		if(result == read_val){
 			debounce_count++;
 		}
-	}
-	if(debounce_count != 10){
-		result = -1;
+		if(result != read_val){
+			i = 0;
+			debounce_count = 0;
+		}
 	}
 	close(fsr_fd);
 	return result;
 }
+
+int read_in_calibration_data(){
+	int fd;
+	int i;
+	char output_str[255];
+	char *end_ptr;
+	memset(output_str,0,255);
+
+
+	fd = open(OUTPUT_FILE, O_RDONLY);
+	if(fd == -1){
+		perror("Spice_Rack_App: read_in_calibration_data - Failed to open calibration data file - ");
+		syslog(LOG_DEBUG, "Spice_Rack_App: read_in_calibration_data - Failed to open calibration data filei %s", OUTPUT_FILE);
+		return -1;
+	}
+
+	for(i=0;i<(SPICE_RACK_SIZE+2);i++){
+		read_line(fd, output_str);
+		parse_line(output_str,i);
+	}
+
+	spice_rack->empty_jar_adc = strtol(spice_rack->spices[1].spice_entries.entries[2], &end_ptr, 10);
+	spice_rack->empty_rack_adc = strtol(spice_rack->spices[0].spice_entries.entries[2], &end_ptr, 10);
+
+	close(fd);
+	return 0;
+}
+
 
 int read_calibrate_button(){
 	int fd;
@@ -325,6 +588,7 @@ int calibrate_spice_rack(char *read_val, int read_len){
 	int prev_fsr_status = 0;
 	int fsr_diff = 0;
 	int spice_num = 0;
+	float mass = 0;
 	char *user_input_val;
 	char *end_ptr;
 	char *spice_name;
@@ -337,13 +601,13 @@ int calibrate_spice_rack(char *read_val, int read_len){
 		sleep(1);
 	}
 	printf("All spices have been removed. Collecting weight measurement of empty rack\n");
-	get_average_weight(read_val, read_len,10);
+	spice_rack->empty_rack_adc = get_average_weight(read_val, read_len,10);
 	syslog(LOG_DEBUG,"Spice_Rack_App: calibrate_spice_rack - Empty Rack Weight Reading is %s", read_val);
 	printf("Empty Rack Weight Reading is %s\n", read_val);
 	strcpy(spice_name, "Empty Rack");
-	store_measurement(spice_num, spice_name, read_val);
+	store_measurement(spice_num, spice_name, read_val, mass);
 
-	printf("\nAn Empty Spice Jar is assumed to be %i Grams.\n", empty_jar_mass);
+	printf("\nAn Empty Spice Jar is assumed to be %f Grams.\n", spice_rack->empty_jar_mass);
 	printf("Do you wish to change this? (y/n)?)");
 	user_input_val = (char *)malloc(10 * sizeof(char));
 	while(1){
@@ -359,8 +623,8 @@ int calibrate_spice_rack(char *read_val, int read_len){
 				if(fgets(user_input_val, 10, stdin)){
 					user_input_val[strcspn(user_input_val, "\n")] = 0;
 				}
-				empty_jar_mass = strtol(user_input_val, &end_ptr, 10);
-				if(empty_jar_mass == LONG_MIN || empty_jar_mass == LONG_MAX){
+				spice_rack->empty_jar_mass = strtof(user_input_val, &end_ptr);
+				if(spice_rack->empty_jar_mass == LONG_MIN || spice_rack->empty_jar_mass == LONG_MAX){
 					perror("Spice_Rack_App: calibrate_spice_rack - User entered mass that is invalid - ");
 					continue;
 				}
@@ -384,12 +648,12 @@ int calibrate_spice_rack(char *read_val, int read_len){
 		if(fsr_status != 1){
 			continue;
 		}
-		get_average_weight(read_val, read_len, 10);
+		spice_rack->empty_jar_adc = get_average_weight(read_val, read_len, 10);
 		syslog(LOG_DEBUG,"Spice_Rack_App: calibrate_spice_rack - Empty Jar Weight Reading is %s", read_val);
 		printf("Empty Jar Weight Reading is %s\n", read_val);
 		memset(spice_name,0,MAX_SPICE_NAME_SIZE);
-		sprintf(spice_name, "Empty Jar-%ig", empty_jar_mass);
-		store_measurement(spice_num, spice_name, read_val);
+		snprintf(spice_name, MAX_SPICE_NAME_SIZE, "Empty Jar-%ig", (int)spice_rack->empty_jar_mass);
+		store_measurement(spice_num, spice_name, read_val, mass);
 		break;
 	}
 
@@ -397,8 +661,10 @@ int calibrate_spice_rack(char *read_val, int read_len){
 	while(fsr_status != 0){
 		fsr_status = read_fsr_status();
 	}
+	spice_rack->curr_adc_reading = spice_rack->empty_rack_adc;
 
 	printf("Now you will need to place and leave each spice on the rack. Only place one spice at a time when prompted to do so.\nGo ahead and place the first spice in Spice1 position\n");
+	spice_num = 0;
 	while(1){
 		spice_num = 1;
 		fsr_status = read_fsr_status();
@@ -413,18 +679,18 @@ int calibrate_spice_rack(char *read_val, int read_len){
 			}
 			printf("Detected a spice was placed in Spice%i position. Beginning weighing now\n", spice_num);
 			get_average_weight(read_val, read_len,10);
+			mass = adc_reading_to_grams();
 			syslog(LOG_DEBUG,"Spice_Rack_App: calibrate_spice_rack - Weight Reading for Spice%i is %s", spice_num, read_val);
 			printf("Spice%i Weight Reading is %s\n", spice_num, read_val);
-			//TODO Add scanf function to have user input spice names and include that in call to store
 			memset(spice_name,0,MAX_SPICE_NAME_SIZE);
 			printf("Enter the name of this spice: ");
 			if(fgets(spice_name, MAX_SPICE_NAME_SIZE, stdin)){
 				spice_name[strcspn(spice_name, "\n")] = 0;
 				printf("Spice Name is %s\n", spice_name);
 			}
-			store_measurement(spice_num, spice_name, read_val);
+			store_measurement(spice_num, spice_name, read_val, mass);
 			prev_fsr_status = fsr_status;
-			if(spice_num == 3){
+			if(spice_num == SPICE_RACK_SIZE){
 				break;
 			}
 			else{
@@ -488,21 +754,148 @@ int free_calibrate_button(){
 	return 0;
 }
 
+int setup_spice_rack_struct(){
+	int i;
+	int size = 100;
+
+	for(i=0;i<(SPICE_RACK_SIZE+2);i++){
+		spice_rack->spices[i].spice_search_strings.search_strings[0] = (char *)malloc(size*sizeof(char));
+		spice_rack->spices[i].spice_search_strings.search_strings[1] = (char *)malloc(size*sizeof(char));
+		spice_rack->spices[i].spice_search_strings.search_strings[2] = (char *)malloc(size*sizeof(char));
+		spice_rack->spices[i].spice_search_strings.search_strings[3] = (char *)malloc(size*sizeof(char));
+		spice_rack->spices[i].spice_entries.entries[0] = (char *)malloc(size*sizeof(char));
+		spice_rack->spices[i].spice_entries.entries[1] = (char *)malloc(size*sizeof(char));
+		spice_rack->spices[i].spice_entries.entries[2] = (char *)malloc(size*sizeof(char));
+		spice_rack->spices[i].spice_entries.entries[3] = (char *)malloc(size*sizeof(char));
+		memset(spice_rack->spices[i].spice_search_strings.search_strings[0],0,size);
+		memset(spice_rack->spices[i].spice_search_strings.search_strings[1],0,size);
+		memset(spice_rack->spices[i].spice_search_strings.search_strings[2],0,size);
+		memset(spice_rack->spices[i].spice_search_strings.search_strings[3],0,size);
+		strcpy(spice_rack->spices[i].spice_search_strings.search_strings[0], "Spice_Location:\0");
+		strcpy(spice_rack->spices[i].spice_search_strings.search_strings[1], "Spice_Name:\0");
+		strcpy(spice_rack->spices[i].spice_search_strings.search_strings[2], "ADC_Reading:");
+		strcpy(spice_rack->spices[i].spice_search_strings.search_strings[3], "Calibrated_Weight(grams):");
+		memset(spice_rack->spices[i].spice_entries.entries[0],0,size);
+		memset(spice_rack->spices[i].spice_entries.entries[1],0,size);
+		memset(spice_rack->spices[i].spice_entries.entries[2],0,size);
+		memset(spice_rack->spices[i].spice_entries.entries[3],0,size);
+      	}
+
+	return 0;
+}
+
+int cleanup_spice_rack_struct(){
+	int i;
+
+	for(i=0;i<(SPICE_RACK_SIZE+2);i++){
+		free(spice_rack->spices[i].spice_search_strings.search_strings[0]); 
+		free(spice_rack->spices[i].spice_search_strings.search_strings[1]); 
+		free(spice_rack->spices[i].spice_search_strings.search_strings[2]); 
+		free(spice_rack->spices[i].spice_search_strings.search_strings[3]); 
+		free(spice_rack->spices[i].spice_entries.entries[0]);
+		free(spice_rack->spices[i].spice_entries.entries[1]);
+		free(spice_rack->spices[i].spice_entries.entries[2]);
+		free(spice_rack->spices[i].spice_entries.entries[3]);
+      	}
+
+	return 0;
+}
+
+static void fsr_monitor(union sigval sigval){
+	struct thread_data *td = (struct thread_data*) sigval.sival_ptr;
+	if(pthread_mutex_lock(&td->lock) == 0){	
+		td->fsr_prev_status = td->fsr_cur_status;
+		td->fsr_cur_status = read_fsr_status();
+		syslog(LOG_DEBUG, "FSR CUR=%i and FSR PREV=%i\n", td->fsr_cur_status, td->fsr_prev_status);
+
+		if(td->fsr_cur_status != td->fsr_prev_status){
+			td->fsr_alert = 1;
+		}
+		pthread_mutex_unlock(&td->lock);
+	}
+	return;
+}
+
+int setup_fsr_status_timer(struct sigevent *sigev, timer_t *timerid, struct thread_data *td, struct itimerspec *timerspec, struct timespec *start_time){
+	td->hb = 0;
+	td->fsr_alert = 0;
+	td->fsr_cur_status = read_fsr_status();
+	if(pthread_mutex_init(&td->lock,NULL) != 0){
+		perror("Spice_Rack_App: setup_fsr_status_timer - Failed to initiate timer mutex - ");
+		return -1;
+	}
+	sigev->sigev_notify = SIGEV_THREAD;
+	sigev->sigev_value.sival_ptr = td;
+	sigev->sigev_notify_function = fsr_monitor;
+	timerspec->it_interval.tv_sec = 10;
+	timerspec->it_interval.tv_nsec = 0;
+	if(clock_gettime(CLOCK_MONOTONIC, start_time) != 0){
+		printf("Spice_Rack_App: setup_fsr_status_timer - Error getting current time\n");
+		return -1;
+	}
+	printf("Start time is %li\n", start_time->tv_sec);
+	start_time->tv_sec = start_time->tv_sec + 2;
+	if(timer_create(CLOCK_MONOTONIC, sigev, timerid) != 0){
+		printf("Spice_Rack_App: setup_fsr_status_timer - Unable to create timer\n");
+		return -1;
+	}
+	else{
+		printf("Spice_Rack_App: setup_fsr_status_timer - Successfully setup timer\n");
+		timerspec->it_value.tv_sec = start_time->tv_sec;
+		if(timer_settime(*timerid, TIMER_ABSTIME, timerspec, NULL) != 0){
+			printf("Spice_Rack_App: setup_fsr_status_timer - Unable to start timer\n");
+			return -1;
+		}
+		printf("Spice_Rack_App: setup_fsr_status_timer - Successfully started timer\n");
+	}	
+
+	return 0;
+}
+
+int convert_fsr_stat_to_spice_num(int spice_num){
+	int i;
+	for(i=0; i < SPICE_RACK_SIZE; i++){
+		if((spice_num >> i) == 1){
+			spice_num = i+1;
+			printf("Spice Num is %i\n", spice_num);
+			break;
+		}
+	}
+	return spice_num;
+}
+
 int main() {
 	char *read_val;
 	int read_len = 16;
-	int i = 0;
-	int fsr_status;
-	int calibrate = 0;
+//	int fsr_status;
+//	int calibrate = 0;
 	int fd;
+	int spice_num;
+	float mass = 0;
+	char spice_name[32];
+	struct sigevent sigev;
+	struct itimerspec timerspec;
+	struct timespec start_time;
+	struct thread_data td;
+	timer_t timerid;
 
 	openlog(NULL,0,LOG_USER);
 	syslog(LOG_DEBUG,"Spice_Rack_App: Starting Application");
 
 	setup_calibrate_button();
 	read_val = (char *)malloc(read_len * sizeof(char));
+	//Must allocate spice rack size and we have flexible array members for spices and within 
+	//each spice struct we have flexible arrays for search string and entries so must 
+	//allocate for those too.
+	printf("Got Here\n");
+	spice_rack = (struct spice_rack *)malloc(sizeof(struct spice_rack) + ((SPICE_RACK_SIZE+2)*sizeof(struct spice)) + (2*(4 * sizeof(char[100]))));
+	setup_spice_rack_struct();
 	memset(read_val,0,read_len);
+	spice_rack->curr_adc_reading = 0;
+	spice_rack->empty_jar_mass = EMPTY_JAR_MASS_DEF;
 
+	printf("Spice search string=%p and entry=%p\n", spice_rack->spices[0].spice_search_strings.search_strings[0], spice_rack->spices[0].spice_entries.entries[0]);
+	
 	fd = open(OUTPUT_FILE, O_RDONLY);
 	if(fd == -1){
 		printf("Unable to find previous calibration data to use. Performing a new calibration\n");
@@ -510,22 +903,52 @@ int main() {
 	}
 	else{
 		printf("Found previous calibration data to use. To perform new calibration press the calibration button\n");
-	}
-	get_average_weight(read_val, read_len, 10);
-	for(i=0; i<20; i++){
-		calibrate = read_calibrate_button();
-		syslog(LOG_DEBUG,"Spice_Rack_App: main - Calibrate Button is %i", calibrate);
-		printf("Calibrate Button is %i\n", calibrate);
+		read_in_calibration_data();
 
-		memset(read_val,0,read_len);
-		fsr_status = read_fsr_status();
-		syslog(LOG_DEBUG,"Spice_Rack_App: main - FSR Status is %i", fsr_status);
-		printf("FSR Status is %i\n", fsr_status);
-
-		read_weight(read_val, read_len);
-		syslog(LOG_DEBUG,"Spice_Rack_App: main - Weight Reading is %s", read_val);
-		printf("Weight Reading is %s\n", read_val);
 	}
+
+	memset(&sigev, 0, sizeof(struct sigevent));
+	memset(&timerspec, 0, sizeof(struct itimerspec));
+	memset(&td, 0, sizeof(struct thread_data));
+
+	setup_fsr_status_timer(&sigev, &timerid, &td, &timerspec, &start_time);
+	while(1){
+		spice_num = 0;
+		if(pthread_mutex_lock(&td.lock) == 0){
+			if(td.fsr_alert == 1){
+				printf("FSR Status Changed!\n");
+				td.fsr_alert = 0;
+				if(td.fsr_cur_status > td.fsr_prev_status){
+					//If a spice was added back
+					spice_num = td.fsr_cur_status - td.fsr_prev_status;
+					printf("Added spice back. Delta = %i\n", spice_num);
+					spice_num = convert_fsr_stat_to_spice_num(spice_num);
+					printf("Collecting Weight Measurement now\n");
+					get_average_weight(read_val, read_len, 20);
+					mass = adc_reading_to_grams();
+					strncpy(spice_name, spice_rack->spices[spice_num+1].spice_entries.entries[1],32);
+					printf("Spice_name in main is %s\n", spice_name);
+					store_measurement(spice_num, spice_name, read_val, mass);
+					//Need to update both ADC reading in output file as well as grams
+				}
+				else{
+					//If a spice was removed
+					spice_num = td.fsr_prev_status - td.fsr_cur_status;
+					printf("Removed Spice. Delta = %i\n", spice_num);
+					spice_num = convert_fsr_stat_to_spice_num(spice_num);
+					//this collects weight and updates the prev and curr adc readings in struct
+					printf("Collecting Weight Measurement now\n");
+					get_average_weight(read_val, read_len, 20);
+					printf("Done collecting weight \n");
+				}
+				
+			}
+			pthread_mutex_unlock(&td.lock);
+		}
+	}
+	
+	cleanup_spice_rack_struct();
+	free(spice_rack);
 	free(read_val);
 	free_calibrate_button();
 }
