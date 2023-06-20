@@ -22,6 +22,12 @@ struct spice_rack{
 	struct spice spices[];
 };
 
+struct calibration_status{
+	int calibration_button;
+	pthread_t calibrate_thread;
+	pthread_mutex_t calibration_lock;
+};
+
 struct thread_data{
 	int hb;
 	int fsr_prev_status;
