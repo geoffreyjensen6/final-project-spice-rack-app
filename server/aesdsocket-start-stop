@@ -3,7 +3,7 @@ app="aesdsocket_server -d"
 case "$1" in
 	start)
 		echo "Starting aesdsocket server"
-		start-stop-daemon -S -n aesdsocket_server -a /usr/bin/aesdsocket_server -- -d
+		start-stop-daemon -S -n aesdsocket_server -a /usr/bin/spice_rack/aesdsocket_server -- -d
 		;;
 	stop)
 		echo "Stopping aesdsocker server"

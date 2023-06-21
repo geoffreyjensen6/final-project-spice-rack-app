@@ -1230,9 +1230,9 @@ static int update_spice_rack(int spice_num, char *spice_name, char *read_val, fl
 	return 0;
 }
 
-int main() {
+int main(int argc, char *argv[]) {
 	struct sigaction socket_sigaction;
-
+	int daemon_pid;
 	char *read_val;
 	int read_len = 8;
 	int fd;
@@ -1262,6 +1262,26 @@ int main() {
                 perror("Spice_Rack_App: main - Error registering for SIGINT - ");
 		syslog(LOG_DEBUG, "Spice_Rack_App: main - Error registering for SIGINT - %s\n", strerror(errno));
 
+        }
+
+	//Start Daemon if user provided -d argument
+        if(argc == 2){
+                if(strcmp(argv[1],"-d") == 0){
+                        syslog(LOG_DEBUG,"Spice_Rack_App: main - Starting Daemon\n");
+                        //Create Daemon
+                        daemon_pid = fork();
+                        if (daemon_pid == -1){
+                                return -1;
+                        }
+                        else if (daemon_pid != 0){
+                                exit(EXIT_SUCCESS);
+                        }
+                        setsid();
+                        chdir("/");
+                        open("/dev/null",O_RDWR);
+                        dup(0);
+                        dup(0);
+                }
         }
 
 	//Setup Calibration Button and Launch Thread to Monitor Status
@@ -1328,6 +1348,9 @@ int main() {
 		syslog(LOG_DEBUG, "Spice_Rack_App: main - Failed to setup FSR timer\n");
 		return -1;
 	}
+	
+	
+
 
 	printf("Application is now initialized and running...\n");
 	while(1){

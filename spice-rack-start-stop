@@ -1,0 +1,25 @@
+#!/bin/sh
+app="spice_rack_app -d"
+calibration_file="/usr/bin/spice_rack/spice_rack_measurements.txt"
+case "$1" in
+	start)
+		if [ -f $calibration_file ];
+		then
+			echo "Starting Spice Rack App"
+			echo "WARNING: Do not use calibration button when app is running as Daemon because the calibration routine requires user input"
+			start-stop-daemon -S -n spice_rack_app -a /usr/bin/spice_rack/spice_rack_app -- -d
+		else
+			echo "Unable to find previous calibration data for Spice Rack App. Cannot launch application as Daemon without it."
+			echo "To perform calibration, launch manually from </usr/bin/spice_rack/spice_rack_app>"
+		fi
+		;;
+	stop)
+		echo "Stopping Spice Rack App"
+		start-stop-daemon -K -n spice_rack_app
+		;;
+	*)
+		echo "Usage: $0 {start|stop}"
+		exit 1
+esac
+
+exit 0
