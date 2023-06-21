@@ -18,6 +18,9 @@
 #define MAX_LINE_LENGTH 160 //80 + (5*MAX_FILE_ENTRY)
 #define SPICE_RACK_SIZE 3
 #define NUM_COLUMNS 5
+#define ADC_COLUMN 2
+#define MASS_COLUMN 3
+#define TSP_COLUMN 4
 #define EMPTY_JAR_MASS_DEF 133.245
 #define CALIBRATE_GPIO "27"
 //Files
@@ -145,7 +148,7 @@ static int read_line(int fd, char *output_str){
 	return result;
 }
 
-int parse_line(char *output_str, int i){
+static int parse_line(char *output_str, int i){
 	int result = 0;
 	int substring_len = 0;
 	char *start_ptr = output_str;
@@ -542,7 +545,7 @@ static int consolidated_spice_file(){
 	for(i=2;i<(SPICE_RACK_SIZE+2);i++){
 		write(consolidated_fd, spice_rack->spices[i].spice_entries.entries[1], strlen(spice_rack->spices[i].spice_entries.entries[1]));
 		write(consolidated_fd, " - ", 3);
-		write(consolidated_fd, spice_rack->spices[i].spice_entries.entries[4], strlen(spice_rack->spices[i].spice_entries.entries[4]));
+		write(consolidated_fd, spice_rack->spices[i].spice_entries.entries[TSP_COLUMN], strlen(spice_rack->spices[i].spice_entries.entries[TSP_COLUMN]));
 		write(consolidated_fd, "tsp\n", 4);
 	}
 
@@ -966,6 +969,12 @@ static int calibrate_spice_rack(char *read_val, int read_len){
 	}
 	free(spice_name);
 
+	//Produce a consolidated data file for TCP socket queries
+	if(consolidated_spice_file() != 0){
+		printf("Spice_Rack_App: calibrate_spice_rack - Failed to create consolidated spice file\n");
+		syslog(LOG_DEBUG, "Spice_Rack_App: calibrate_spice_rack - Failed to create consolidated spice file\n");
+	}
+
 	printf("Finished Calibration.\n");
 	syslog(LOG_DEBUG, "Finished Calibration.\n");
 
@@ -1195,6 +1204,32 @@ static int convert_fsr_stat_to_spice_num(int spice_num){
 	return spice_num;
 }
 
+static int update_spice_rack(int spice_num, char *spice_name, char *read_val, float mass, float tsps){
+	char *mass_str;
+	char *tsps_str;
+
+	if((mass_str = (char *)malloc(MAX_FILE_ENTRY_LEN * sizeof(char))) == NULL){
+		perror("Spice_Rack_App: update_spice_rack - Failed on Malloc.");
+		syslog(LOG_DEBUG, "Spice_Rack_App: update_spice_rack - Failed on Malloc - %s\n", strerror(errno));
+	}
+	memset(mass_str, 0, MAX_FILE_ENTRY_LEN);
+	if((tsps_str = (char *)malloc(MAX_FILE_ENTRY_LEN * sizeof(char))) == NULL){
+		perror("Spice_Rack_App: update_spice_rack - Failed on Malloc.");
+		syslog(LOG_DEBUG, "Spice_Rack_App: update_spice_rack - Failed on Malloc. - %s\n", strerror(errno));
+	}
+	memset(tsps_str, 0, MAX_FILE_ENTRY_LEN);
+
+	strcpy(spice_rack->spices[spice_num+1].spice_entries.entries[ADC_COLUMN], read_val);
+	snprintf(mass_str, MAX_FILE_ENTRY_LEN, "%3.6f", mass);
+	strcpy(spice_rack->spices[spice_num+1].spice_entries.entries[MASS_COLUMN], mass_str);
+	snprintf(tsps_str, MAX_FILE_ENTRY_LEN, "%3.6f", tsps);
+	strcpy(spice_rack->spices[spice_num+1].spice_entries.entries[TSP_COLUMN],tsps_str);
+
+	free(mass_str);
+	free(tsps_str);
+	return 0;
+}
+
 int main() {
 	struct sigaction socket_sigaction;
 
@@ -1234,13 +1269,6 @@ int main() {
 		printf("Spice_Rack_App: main - error in setting up the calibration button. Exiting program\n");
 		syslog(LOG_DEBUG, "Spice_Rack_App: main - error in the setup calibration button function. Exiting program\n");
 	}
-	
-	//Initialize Spice Rack Struct
-	if(setup_spice_rack_struct() != 0){
-	//	return -1;
-	}	
-	spice_rack->curr_adc_reading = 0;
-	spice_rack->empty_jar_mass = EMPTY_JAR_MASS_DEF;
 
 	//Malloc String for Storing ADC measurements in
 	if((read_val = (char *)malloc(read_len * sizeof(char))) == NULL){
@@ -1249,6 +1277,19 @@ int main() {
 	}
 	memset(read_val,0,read_len);
 
+	
+	//Initialize Spice Rack Struct
+	if(setup_spice_rack_struct() != 0){
+	//	return -1;
+	}	
+	spice_rack->curr_adc_reading = 0;
+	spice_rack->empty_jar_mass = EMPTY_JAR_MASS_DEF;
+	printf("Collecting Weight Measurement now\n");
+	syslog(LOG_DEBUG, "Spice_Rack_App: main - Collecting Weight Measurement now\n");
+	get_average_weight(read_val, read_len, 10);
+	printf("Done collecting weight\n");
+	syslog(LOG_DEBUG, "Spice_Rack_App: main - Done collecting weight\n");
+	
 	//Check for Previous Calibration Data
 	fd = open(OUTPUT_FILE, O_RDONLY);
 	if(fd == -1){
@@ -1298,20 +1339,25 @@ int main() {
 					//If a spice was added back
 					spice_num = td.fsr_cur_status - td.fsr_prev_status;
 					spice_num = convert_fsr_stat_to_spice_num(spice_num);
-					printf("Added spice%i back\n", spice_num);
-					syslog(LOG_DEBUG, "Added spice%i back\n", spice_num);
+					printf("Added spice%i\n", spice_num);
+					syslog(LOG_DEBUG, "Spice_Rack_App: main - Added spice%i\n", spice_num);
 					printf("Collecting Weight Measurement now\n");
-					syslog(LOG_DEBUG, "Collecting Weight Measurement now\n");
+					syslog(LOG_DEBUG, "Spice_Rack_App: main - Collecting Weight Measurement now\n");
 					get_average_weight(read_val, read_len, 10);
 					printf("Done collecting weight\n");
-					syslog(LOG_DEBUG, "Done collecting weight\n");
+					syslog(LOG_DEBUG, "Spice_Rack_App: main - Done collecting weight\n");
 					mass = adc_reading_to_grams();
 					strncpy(spice_name, spice_rack->spices[spice_num+1].spice_entries.entries[1],32);
 					tsps = convert_grams_to_tsp(spice_name, mass);
-					store_measurement(spice_num, spice_name, read_val, mass, tsps);
+					update_spice_rack(spice_num, spice_name, read_val, mass, tsps);
 					if(store_measurement(spice_num, spice_name, read_val, mass, tsps) != 0){
 						printf("Error storing measurements to file\n");
 						syslog(LOG_DEBUG, "Spice_Rack_App: calibrate_spice_rack - Error storing measurements to file\n");
+					}
+					//Produce a consolidated data file for TCP socket queries
+					if(consolidated_spice_file() != 0){
+						printf("Spice_Rack_App: main - Failed to create consolidated spice file\n");
+						syslog(LOG_DEBUG, "Spice_Rack_App: main - Failed to create consolidated spice file\n");
 					}
 				}
 				else{
@@ -1319,13 +1365,13 @@ int main() {
 					spice_num = td.fsr_prev_status - td.fsr_cur_status;
 					spice_num = convert_fsr_stat_to_spice_num(spice_num);
 					printf("Removed Spice%i\n", spice_num);
-					syslog(LOG_DEBUG, "Removed Spice%i\n", spice_num);
+					syslog(LOG_DEBUG, "Spice_Rack_App: main - Removed Spice%i\n", spice_num);
 					//Collects weight and updates the prev and curr adc readings in struct
 					printf("Collecting Weight Measurement now\n");
-					syslog(LOG_DEBUG, "Collecting Weight Measurement now\n");
+					syslog(LOG_DEBUG, "Spice_Rack_App: main - Collecting Weight Measurement now\n");
 					get_average_weight(read_val, read_len, 10);
 					printf("Done collecting weight\n");
-					syslog(LOG_DEBUG, "Done collecting weight\n");
+					syslog(LOG_DEBUG, "Spice_Rack_App: main - Done collecting weight\n");
 				}
 				
 			}
@@ -1334,6 +1380,17 @@ int main() {
 		if(pthread_mutex_lock(&calibration.calibration_lock) == 0){
 			if(calibration.calibration_button == 1){
 				calibrate_spice_rack(read_val, read_len);
+				//Read in Calibration Data to Spice Rack Struct
+				if(read_in_calibration_data() != 0){
+					printf("Spice_Rack_App: main - Failed to read in calibration data\n");
+					syslog(LOG_DEBUG, "Spice_Rack_App: main - Failed to read in calibration data\n");
+				}
+
+				//Produce a consolidated data file for TCP socket queries
+				if(consolidated_spice_file() != 0){
+					printf("Spice_Rack_App: main - Failed to create consolidated spice file\n");
+					syslog(LOG_DEBUG, "Spice_Rack_App: main - Failed to create consolidated spice file\n");
+				}
 				calibration.calibration_button = 0;
 			}
 			pthread_mutex_unlock(&calibration.calibration_lock);
